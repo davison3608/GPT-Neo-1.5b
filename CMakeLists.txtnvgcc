@@ -1,0 +1,276 @@
+cmake_minimum_required(VERSION 3.18)
+project(talkterminal LANGUAGES CUDA CXX)
+
+# 强制调试模式，禁用优化
+set(CMAKE_BUILD_TYPE Debug CACHE STRING "构建类型" FORCE)
+
+# 配置C++17标准（同时适用于CUDA和C++）
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# 编译器配置：区分Qt代码和CUDA代码的编译方式
+set(CMAKE_CUDA_HOST_COMPILER /usr/bin/g++)  # nvcc内部调用的主机编译器
+set(CMAKE_CXX_COMPILER /usr/bin/g++)        # Qt代码使用g++编译（关键修改）
+set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)  # CUDA编译器
+
+# nvcc编译选项（调试模式专用）
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} \
+    -O0 -g -G \
+    --expt-relaxed-constexpr \
+    --default-stream per-thread \
+    --compiler-options -fPIC")
+
+# 启用位置无关代码
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# -------------------- Qt5配置（新增）--------------------
+# 启用Qt元对象编译（moc）、资源文件（rcc）处理
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+# 查找Qt5必需模块（QML/UI相关）
+find_package(Qt5 COMPONENTS 
+    Core 
+    Gui 
+    Qml 
+    Quick 
+    QuickControls2  # 用于QML控件（如Button、TextField）
+    REQUIRED
+)
+if(NOT Qt5_FOUND)
+    message(FATAL_ERROR "Qt5未找到，请确保已安装qt5-qml、qt5-quick等包")
+endif()
+message(STATUS "找到Qt5: ${Qt5_DIR} (版本: ${Qt5_VERSION})")
+
+# CUDA路径配置（适配CUDA 11+）
+set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda" CACHE PATH "CUDA安装路径")
+set(CUDA_INCLUDE_DIRS "${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/include")
+
+# 验证CUDA安装完整性
+if(NOT EXISTS "${CUDA_INCLUDE_DIRS}/cuda_runtime.h")
+    message(FATAL_ERROR "CUDA头文件缺失: ${CUDA_INCLUDE_DIRS}/cuda_runtime.h")
+endif()
+if(NOT EXISTS "${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/libcudart.so")
+    message(FATAL_ERROR "CUDA运行时库缺失: ${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/libcudart.so")
+endif()
+
+# 配置CUDA架构（根据实际GPU调整）
+set(CUDA_ARCHS 61 86)
+set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCHS})
+
+# 兼容CMake CUDA政策
+if(POLICY CMP0104)
+    cmake_policy(SET CMP0104 NEW)
+endif()
+
+# 第三方依赖路径配置
+set(TVM_HOME $ENV{TVM_HOME})
+if(NOT TVM_HOME)
+    set(TVM_HOME "$ENV{HOME}/tvm" CACHE PATH "TVM路径" FORCE)
+    message(WARNING "未设置TVM_HOME，使用默认路径: ${TVM_HOME}")
+endif()
+
+set(DLPACK_HOME "${TVM_HOME}/3rdparty/dlpack" CACHE PATH "DLPack路径")
+
+set(TENSORRT_ROOT $ENV{TENSORRT_ROOT})
+if(NOT TENSORRT_ROOT)
+    set(TENSORRT_ROOT "/usr/local/TensorRT-8.6.1.6" CACHE PATH "TensorRT路径" FORCE)
+    message(WARNING "未设置TENSORRT_ROOT，使用默认路径: ${TENSORRT_ROOT}")
+endif()
+
+# 查找DMLC库
+find_library(DMLC_LIBRARY
+        NAMES dmlc libdmlc
+        PATHS
+        "/usr/local/lib"                  # 系统安装路径
+        "${TVM_HOME}/3rdparty/dmlc-core/build"  # 源码编译路径（备选）
+        "${TVM_HOME}/build"
+        REQUIRED
+        )
+message(STATUS "找到DMLC库: ${DMLC_LIBRARY}")
+
+# Python环境配置
+set(Python_EXECUTABLE "/usr/bin/python3.8" CACHE FILEPATH "Python解释器路径" FORCE)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+message(STATUS "找到Python: ${Python_EXECUTABLE} (版本: ${Python_VERSION})")
+if(NOT Python_EXECUTABLE STREQUAL "/usr/bin/python3.8")
+    message(FATAL_ERROR "Python环境不匹配！当前绑定: ${Python_EXECUTABLE}，预期: /usr/bin/python3.8")
+endif()
+
+# 查找pybind11
+find_package(pybind11 CONFIG REQUIRED
+        HINTS /usr/local/share/cmake/pybind11
+        PATHS /usr/local/lib/cmake/pybind11
+        )
+message(STATUS "找到pybind11: ${pybind11_INCLUDE_DIRS}")
+
+# MySQL配置
+set(MySQL_INCLUDE_DIRS "/usr/include/mysql" CACHE PATH "MySQL头文件路径")
+set(MySQL_LIBRARIES "/usr/lib/x86_64-linux-gnu/libmysqlclient.so" CACHE FILEPATH "MySQL库文件")
+
+# 验证核心依赖文件
+foreach(check_path
+        "${MySQL_INCLUDE_DIRS}/mysql.h"
+        "${MySQL_LIBRARIES}"
+        "${DLPACK_HOME}/include/dlpack/dlpack.h"
+        )
+    if(NOT EXISTS "${check_path}")
+        message(FATAL_ERROR "关键依赖缺失: ${check_path}")
+    endif()
+endforeach()
+
+# 查找TVM库
+find_path(TVM_INCLUDE_DIRS
+        NAMES tvm/runtime/c_runtime_api.h
+        PATHS "${TVM_HOME}/include" "/usr/local/include/tvm"
+        REQUIRED
+        )
+find_library(TVM_LIBRARY NAMES tvm PATHS "${TVM_HOME}/build" "/usr/local/lib" REQUIRED)
+find_library(TVM_RUNTIME_LIBRARY NAMES tvm_runtime PATHS "${TVM_HOME}/build" "/usr/local/lib" REQUIRED)
+message(STATUS "找到TVM库: ${TVM_LIBRARY}")
+
+# 查找TensorRT库
+find_path(TENSORRT_INCLUDE_DIRS NAMES NvInfer.h PATHS "${TENSORRT_ROOT}/include" REQUIRED)
+find_library(NVINFER_LIBRARY NAMES nvinfer PATHS "${TENSORRT_ROOT}/lib" REQUIRED)
+find_library(NVINFER_PLUGIN_LIBRARY NAMES nvinfer_plugin PATHS "${TENSORRT_ROOT}/lib" REQUIRED)
+find_library(NVPARSERS_LIBRARY NAMES nvparsers PATHS "${TENSORRT_ROOT}/lib")
+message(STATUS "找到TensorRT库: ${NVINFER_LIBRARY}")
+
+# 查找CUDA NVTX库
+find_library(NVTOOLS_LIBRARY
+        NAMES nvToolsExt
+        PATHS "${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib"
+        REQUIRED
+        )
+message(STATUS "找到NVTX库: ${NVTOOLS_LIBRARY}")
+
+# 包含目录汇总（新增Qt头文件路径）
+include_directories(
+        include                                  # 项目本地头文件
+        ${CUDA_INCLUDE_DIRS}                     # CUDA头文件
+        "/usr/local/include"                     # 系统安装的DMLC头文件
+        ${DLPACK_HOME}/include                   # DLPack头文件
+        ${pybind11_INCLUDE_DIRS}                 # pybind11头文件
+        ${Python_INCLUDE_DIRS}                   # Python头文件
+        ${MySQL_INCLUDE_DIRS}                    # MySQL头文件
+        ${TVM_INCLUDE_DIRS}                      # TVM头文件
+        ${TENSORRT_INCLUDE_DIRS}                 # TensorRT头文件
+        ${Qt5Core_INCLUDE_DIRS}                  # Qt5核心头文件（新增）
+        ${Qt5Gui_INCLUDE_DIRS}                   # Qt5 GUI头文件（新增）
+        ${Qt5Qml_INCLUDE_DIRS}                   # Qt5 QML头文件（新增）
+        ${Qt5Quick_INCLUDE_DIRS}                 # Qt5 Quick头文件（新增）
+)
+
+# 链接目录汇总
+link_directories(
+        ${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib  # CUDA库目录
+        ${TENSORRT_ROOT}/lib                               # TensorRT库目录
+        ${TVM_HOME}/build                                  # TVM库目录
+        "/usr/local/lib"                                   # 系统安装库目录
+        so/                                                # 项目本地库目录
+)
+
+# 源文件列表（新增terminal.cpp）
+set(SOURCE_FILES
+        # C++源文件（Qt相关代码用g++编译，CUDA代码用nvcc）
+        main.cpp
+        cachequeue.cpp
+        deser.cpp
+        hashnodelru.cpp
+        process.cpp
+        processfunc.cpp
+        sqconnect.cpp
+        termial.cpp           # 原终端相关代码
+        terminal.cpp          # 新增Qt相关源文件（关键修改）
+        csvwirte.cpp
+        embed.cpp
+        qtfilewirte.cpp       # 新增Qt文件操作源文件（假设存在，关键修改）
+        # CUDA源文件（用nvcc编译）
+        init.cu
+        ready.cu
+        infer.cu
+        strpackets.h
+)
+
+# 区分编译方式：Qt相关.cpp用g++，CUDA相关文件用nvcc（关键修改）
+foreach(src ${SOURCE_FILES})
+    if(${src} MATCHES ".*\\.cu$")
+        # CUDA文件强制用nvcc
+        set_source_files_properties(${src} PROPERTIES LANGUAGE CUDA)
+    else()
+        # C++文件（尤其是Qt相关）用g++
+        set_source_files_properties(${src} PROPERTIES LANGUAGE CXX)
+    endif()
+endforeach()
+
+# 添加可执行目标
+add_executable(talkterminal ${SOURCE_FILES} strpackets.h)
+
+# 配置目标属性
+set_target_properties(talkterminal PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+)
+
+# 链接所有依赖库（新增Qt5模块）
+target_link_libraries(talkterminal PRIVATE
+        # Qt5库（关键修改）
+        Qt5::Core
+        Qt5::Gui
+        Qt5::Qml
+        Qt5::Quick
+        Qt5::QuickControls2
+        # 原有依赖
+        pybind11::embed
+        ${MySQL_LIBRARIES}
+        ${TVM_LIBRARY}
+        ${TVM_RUNTIME_LIBRARY}
+        ${DMLC_LIBRARY}
+        ${NVINFER_LIBRARY}
+        ${NVINFER_PLUGIN_LIBRARY}
+        ${NVPARSERS_LIBRARY}
+        # CUDA相关库
+        cuda
+        cudart
+        cublas
+        cublasLt
+        cudnn
+        cufft
+        curand
+        nvrtc
+        nvjpeg
+        ${NVTOOLS_LIBRARY}
+        # Python库
+        ${Python_LIBRARIES}
+)
+
+# 安装配置
+install(TARGETS talkterminal RUNTIME DESTINATION bin)
+install(DIRECTORY so/ DESTINATION lib/talkterminal)
+install(DIRECTORY vocab/ DESTINATION share/talkterminal/vocab)
+
+# 编译后复制依赖库到输出目录
+add_custom_command(TARGET talkterminal POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TVM_LIBRARY}" $<TARGET_FILE_DIR:talkterminal>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NVINFER_LIBRARY}" $<TARGET_FILE_DIR:talkterminal>
+        COMMENT "正在复制依赖共享库到输出目录..."
+)
+
+# 配置验证信息（新增Qt信息）
+message(STATUS "=============================================")
+message(STATUS "编译配置摘要:")
+message(STATUS "  C++编译器: ${CMAKE_CXX_COMPILER}")
+message(STATUS "  CUDA编译器: ${CMAKE_CUDA_COMPILER}")
+message(STATUS "  Qt5版本: ${Qt5_VERSION}")  # 验证Qt配置
+message(STATUS "  CUDA路径: ${CUDA_TOOLKIT_ROOT_DIR}")
+message(STATUS "  TVM路径: ${TVM_HOME}")
+message(STATUS "  TensorRT路径: ${TENSORRT_ROOT}")
+message(STATUS "  目标架构: ${CUDA_ARCHS}")
+message(STATUS "  绑定的Python环境: ${Python_EXECUTABLE}")
+message(STATUS "=============================================")
